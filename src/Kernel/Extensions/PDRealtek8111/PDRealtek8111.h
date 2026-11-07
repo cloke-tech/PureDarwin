@@ -83,6 +83,9 @@ private:
     IOBufferMemoryDescriptor *fRxPacketBuf[kRTLRxDescCount];
     RTLDesc                  *fRxDesc;
     uint32_t                  fRxHead;
+    uint32_t                  fOpt; /* ClokeOS: Boot-Arg rtk_opt, 1 = Empfang neu aufsetzen, 2 = ASPM aus */
+    uint32_t                  fRxOverruns;
+    uint32_t                  fRxRecoveries;
     uint32_t                  fRxPackets;
 
     IOBufferMemoryDescriptor *fTxDescBuf;
@@ -109,6 +112,7 @@ private:
     bool     chipReset();
     bool     readMACAddress();
     bool     initRxRing();
+    void     rxRecover();
     bool     initTxRing();
     void     applyRxFilter();
     void     startChip();

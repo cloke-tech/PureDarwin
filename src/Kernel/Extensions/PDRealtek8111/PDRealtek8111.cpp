@@ -12,6 +12,7 @@
 #include <IOKit/network/IOMbufMemoryCursor.h>
 #include <IOKit/network/IONetworkMedium.h>
 #include <libkern/OSByteOrder.h>
+#include <pexpert/pexpert.h>
 
 #define super IOEthernetController
 
@@ -85,6 +86,7 @@ enum {
     RTK_ISR_TX_OK           = 0x0004,
     RTK_ISR_TX_ERR          = 0x0008,
     RTK_ISR_RX_OVERRUN      = 0x0010,
+    RTK_ISR_RX_FIFO_OVER    = 0x0040,
     RTK_ISR_LINKCHG         = 0x0020,
     RTK_ISR_TX_DESC_UNAVAIL = 0x0080,
     RTK_ISR_TIMEOUT_EXPIRED = 0x4000,
@@ -460,6 +462,7 @@ void PDRealtek8111::stopChip()
 
 bool PDRealtek8111::start(IOService *provider)
 {
+    { uint32_t o = 0; if (!PE_parse_boot_argn("rtk_opt", &o, sizeof(o))) o = 0; fOpt = o; IOLog("PDRealtek8111: rtk_opt=%u\n", o); }
     if (!super::start(provider))
         return false;
 
@@ -475,6 +478,15 @@ bool PDRealtek8111::start(IOService *provider)
 
     checkBridgeDecode();
     forcePowerStateD0();
+    /* ClokeOS: ASPM (L0s/L1) aus, auf neueren Boards bleibt die Verbindung sonst bei Last stehen */
+    {
+        UInt8 cap = 0;
+        if ((fOpt & 2) && fPCIDevice->findPCICapability(0x10 /* PCI Express */, &cap) && cap) {
+            uint16_t lc = fPCIDevice->configRead16(cap + 0x10);
+            fPCIDevice->configWrite16(cap + 0x10, lc & ~(uint16_t)0x0003);
+            IOLog("PDRealtek8111: PCIe link control 0x%04x -> 0x%04x (ASPM off)\n", lc, lc & ~(uint16_t)0x0003);
+        }
+    }
     fPCIDevice->setBusMasterEnable(true);
     fPCIDevice->setMemoryEnable(true);
     IOLog("PDRealtek8111: device cmd=0x%04x bar2=0x%08x\n",
@@ -772,10 +784,37 @@ void PDRealtek8111::interruptOccurred(IOInterruptEventSource *sender, int count)
         return;
     write16(RTK_ISR, isr);
 
-    if (isr & (RTK_ISR_RX_OK | RTK_ISR_RX_ERR | RTK_ISR_RX_OVERRUN))
+    if (isr & (RTK_ISR_RX_OK | RTK_ISR_RX_ERR | RTK_ISR_RX_OVERRUN | RTK_ISR_RX_FIFO_OVER))
         pollReceive();
+    /* ClokeOS: Nach einem Überlauf blieb der Empfang auf einem Ryzen-PC stehen (Netz tot ab etwa 1 MB am Stück);
+     * Empfangsteil neu aufsetzen und mitzählen. */
+    if ((fOpt & 1) && (isr & (RTK_ISR_RX_OVERRUN | RTK_ISR_RX_FIFO_OVER))) {
+        fRxOverruns++;
+        if (fRxOverruns <= 20 || (fRxOverruns % 256) == 0)
+            IOLog("PDRealtek8111: RX overrun isr=0x%04x count=%u -> restart receiver\n", isr, fRxOverruns);
+        rxRecover();
+    }
+    if (isr & RTK_ISR_SYSTEM_ERR)
+        IOLog("PDRealtek8111: PCI system error isr=0x%04x\n", isr);
     if (isr & RTK_ISR_LINKCHG)
         updateLinkStatus();
+}
+
+void PDRealtek8111::rxRecover()
+{
+    fRxRecoveries++;
+    write8(RTK_COMMAND, RTK_CMD_TX_ENB); /* Empfang aus */
+    IODelay(200);
+    for (int i = 0; i < kRTLRxDescCount; i++) {
+        fRxDesc[i].vlanctl = 0;
+        fRxDesc[i].cmdstat = RE_DESC_OWN | (kRTLRxBufferSize & RE_RDESC_CMD_BUFLEN) |
+            ((i == kRTLRxDescCount - 1) ? RE_DESC_EOR : 0);
+    }
+    fRxHead = 0;
+    uint64_t descPhys = fRxDescBuf->getPhysicalAddress();
+    write32(RTK_RXLIST_ADDR_LO, (uint32_t)(descPhys & 0xFFFFFFFF));
+    write32(RTK_RXLIST_ADDR_HI, (uint32_t)(descPhys >> 32));
+    write8(RTK_COMMAND, RTK_CMD_TX_ENB | RTK_CMD_RX_ENB);
 }
 
 void PDRealtek8111::pollReceive()

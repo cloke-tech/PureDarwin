@@ -842,9 +842,7 @@ public:
         return isSmall() ? getSmallDescription() : (struct objc_method_description *)this;
     }
 
-    struct SortBySELAddress :
-    public std::binary_function<const struct method_t::big&,
-                                const struct method_t::big&, bool>
+    struct SortBySELAddress
     {
         bool operator() (const struct method_t::big& lhs,
                          const struct method_t::big& rhs)

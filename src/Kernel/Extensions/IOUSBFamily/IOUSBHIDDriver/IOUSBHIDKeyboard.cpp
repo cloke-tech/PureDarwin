@@ -146,6 +146,7 @@ void IOUSBHIDKeyboard::pollThread(void *arg, wait_result_t)
 
 void IOUSBHIDKeyboard::pollLoop()
 {
+    UInt32 errDelay = 10; // ms; wächst bei Fehlern (ClokeOS: gestoppte Pipe nicht endlos neu lesen)
     while (fRunning) {
         IOByteCount bytesRead = 8;
         bzero(fReportMem->getBytesNoCopy(), 8);
@@ -156,8 +157,15 @@ void IOUSBHIDKeyboard::pollLoop()
             bzero(report, sizeof(report));
             bcopy(fReportMem->getBytesNoCopy(), report, bytesRead > 8 ? 8 : bytesRead);
             handleReport(report);
+            errDelay = 10;
         } else {
-            IOSleep(10);
+            /* ClokeOS: Eine gestoppte (STALL) Interrupt-Pipe bleibt es, bis jemand sie freigibt; ohne das
+             * lief die Schleife ewig und schrieb ~140 Meldungen pro Sekunde in den Kernel-Log. */
+            if (ret == kIOUSBPipeStalled)
+                fInterruptPipe->ClearPipeStall(true);
+            IOSleep(errDelay);
+            if (errDelay < 2000)
+                errDelay *= 2;
         }
     }
 }

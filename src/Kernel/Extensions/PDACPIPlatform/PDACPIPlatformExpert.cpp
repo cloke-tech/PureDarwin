@@ -39,6 +39,8 @@ extern "C" {
 
 #include "../AppleAPIC/PICShared.h"
 #include "PDACPIPlatformExpert.h"
+#include "ClokeTrace.h"
+#include "ClokeTopo.h"
 
 extern "C" {
 #include <uacpi/uacpi.h>
@@ -340,6 +342,7 @@ bool PDACPIPlatformExpert::start(IOService *provider) {
 	PE_halt_restart = handlePEHaltRestart;
 	registerService();
 
+	cloke_trace("PDACPI START: FB-SPUR LAEUFT");
 	publishPlatformUUIDFromDeviceTree();
 	cacheACPIPowerOffFromDeviceTree();
 
@@ -359,6 +362,18 @@ bool PDACPIPlatformExpert::start(IOService *provider) {
 	// calls ml_set_max_cpus(), which is what hw.ncpu reports.
 	fCPUCount = enumerateProcessorsFromMADT();
 	if (fCPUCount == 0) fCPUCount = 1;   // boot processor only
+	fCPUCount = clokeFitTopology(fCPUCount);
+
+	// cloke_pause=N: N Sekunden warten, damit die Zeilen oben lesbar sind, bevor XNU (womöglich mit einer
+	// Panik, die den Bildschirm löscht) die Prozessoren startet.
+	uint32_t pauseSec = 0;    // cloke_pause=N: N Sekunden warten (zum Fotografieren der Zeilen)
+	PE_parse_boot_argn("cloke_pause", &pauseSec, sizeof pauseSec);
+	if (pauseSec) {
+		for (uint32_t t = pauseSec; t > 0; t--) {
+			if (t % 5 == 0) cloke_trace("WEITER IN %u S", t);
+			IOSleep(1000);
+		}
+	}
 
 	// cpus=1 is the escape hatch for a machine whose topology we get wrong;
 	// intermediate values still trip x86_validate_topology().
@@ -379,6 +394,7 @@ bool PDACPIPlatformExpert::start(IOService *provider) {
 	if (!bootCPU->startCommon(fCPUCount)) return false;
 
 	if (fCPUCount > 1) registerProcessors();
+	cloke_trace("PDACPI START DONE, %u CPUS", fCPUCount);
 
 	return true;
 }
@@ -907,6 +923,92 @@ static uint32_t pd_boot_lapic_id(void) {
 	return (ebx >> 24) & 0xff;
 }
 
+// ClokeOS: XNU prüft in x86_validate_topology() die Zahl der angemeldeten Prozessoren gegen topoParms,
+// und das stürzt auf Hybrid-Prozessoren ab (Alder Lake: 12 Threads auf 10 Kernen, CPUID meldet 32 Kerne
+// und nur 12 logische IDs je Paket, daraus wird null Threads je Kern) und bei cpus=N. Die Panik ist nach
+// initialize_screen(6) unsichtbar. Hier: Liste auf einen Thread je Kern kürzen und, wenn XNUs Werte dazu
+// nicht passen, topoParms durch eine stimmige Beschreibung dieser Prozessoren ersetzen (ClokeTopo.h).
+extern "C" cloke_topo_params_t topoParms;
+
+unsigned PDACPIPlatformExpert::clokeFitTopology(unsigned count) {
+	i386_cpu_info_t *ci = cpuid_info();
+	uint32_t smtShift = 1;   // SMT-Ebene von CPUID 0xB; ohne die Leaf bleibt es bei 1 Bit
+	uint32_t eax, ebx, ecx, edx;
+	__asm__ volatile ("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0), "c"(0));
+	if (eax >= 0xb) {
+		__asm__ volatile ("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0xb), "c"(0));
+		if (ebx & 0xffff) smtShift = eax & 0x1f;
+	}
+	cloke_topo_params_t tp = topoParms;
+	cloke_trace("TOPO: MADT %u CPUS, MSR35 %u KERNE %u THREADS, SMT-BITS %u", count, ci->core_count,
+	            ci->thread_count, smtShift);
+	cloke_trace("TOPO: CPUID KERNE/PKG %u LOGISCH/PKG %u", ci->cpuid_cores_per_package,
+	            ci->cpuid_logical_per_package);
+	cloke_trace("XNU: THR/KERN L%u P%u KERN/DIE L%u P%u DIE/PKG L%u P%u", tp.nLThreadsPerCore,
+	            tp.nPThreadsPerCore, tp.nLCoresPerDie, tp.nPCoresPerDie, tp.nLDiesPerPackage,
+	            tp.nPDiesPerPackage);
+	cloke_trace("XNU: THR/DIE L%u P%u THR/PKG L%u P%u PAKETE %u LLC %u", tp.nLThreadsPerDie,
+	            tp.nPThreadsPerDie, tp.nLThreadsPerPackage, tp.nPThreadsPerPackage, tp.nPackages,
+	            tp.maxSharingLLC);
+
+	uint32_t arg = 0;
+	if (PE_parse_boot_argn("cloke_nofit", &arg, sizeof arg) && arg) {
+		cloke_trace("TOPO: cloke_nofit=1, MADT UNVERAENDERT");
+		return count;
+	}
+
+	// 1. Passen XNUs Werte schon zu allen Prozessoren der MADT? (Normale Rechner, QEMU)
+	int why = cloke_topo_check(fLapicIds, count, &tp);
+	arg = 0;
+	bool synth = PE_parse_boot_argn("cloke_synth", &arg, sizeof arg) && arg;   // Test: eigene Werte erzwingen
+	if (why == 0 && !synth) {
+		cloke_trace("TOPO: XNU-WERTE PASSEN, PRUEFUNG OK");
+		return count;
+	}
+	cloke_trace("TOPO: XNU-PRUEFUNG %d WUERDE FEHLEN", why);
+
+	// 2. Alle Prozessoren behalten, APIC-IDs zu gleich großen Kernen gruppieren (cloke_smt=0 lässt das aus)
+	cloke_topo_params_t mine = tp;
+	unsigned n = count, d = 0;
+	arg = 1;
+	PE_parse_boot_argn("cloke_smt", &arg, sizeof arg);
+	if (arg && cloke_topo_synth_pairs(&mine, fLapicIds, count, &d) == 0 &&
+	    cloke_topo_check(fLapicIds, count, &mine) == 0) {
+		cloke_trace("TOPO: ALLE %u CPUS, GRUPPEN ZU %u IDS (%u THREADS JE KERN)", count, d, mine.nLThreadsPerCore);
+	} else {
+		// 3. Ein Thread je Kern, so viele wie XNU aus MSR 0x35 erwartet
+		n = cloke_topo_filter(fLapicIds, count, smtShift, ci->core_count, ci->thread_count);
+		mine = tp;
+		if (n == 0 || cloke_topo_synth(&mine, fLapicIds, n, smtShift) != 0 ||
+		    (why = cloke_topo_check(fLapicIds, n, &mine)) != 0) {
+			cloke_trace("TOPO: KEINE STIMMIGE AUSWAHL (%d), NUR DER BOOT-KERN", why);
+			cloke_trace_show(10);
+			return 1;
+		}
+		cloke_trace("TOPO: %u VON %u CPUS, EIN THREAD JE KERN", n, count);
+	}
+
+	cloke_topo_params_t *live = &topoParms;
+	live->nCoresSharingLLC = mine.nCoresSharingLLC;
+	live->nLCPUsSharingLLC = mine.nLCPUsSharingLLC;
+	live->maxSharingLLC = mine.maxSharingLLC;
+	live->nLThreadsPerCore = mine.nLThreadsPerCore;
+	live->nPThreadsPerCore = mine.nPThreadsPerCore;
+	live->nLCoresPerDie = mine.nLCoresPerDie;
+	live->nPCoresPerDie = mine.nPCoresPerDie;
+	live->nLDiesPerPackage = mine.nLDiesPerPackage;
+	live->nPDiesPerPackage = mine.nPDiesPerPackage;
+	live->nLThreadsPerDie = mine.nLThreadsPerDie;
+	live->nPThreadsPerDie = mine.nPThreadsPerDie;
+	live->nLThreadsPerPackage = mine.nLThreadsPerPackage;
+	live->nPThreadsPerPackage = mine.nPThreadsPerPackage;
+	live->nLCoresPerPackage = mine.nLCoresPerPackage;
+	live->nPCoresPerPackage = mine.nPCoresPerPackage;
+	cloke_trace("TOPO: EIGENE WERTE GESETZT: THR/KERN %u KERN/DIE %u THR/PKG %u", mine.nLThreadsPerCore,
+	            mine.nLCoresPerDie, mine.nLThreadsPerPackage);
+	return n;
+}
+
 // Enabled processors from the MADT, boot CPU first.
 unsigned PDACPIPlatformExpert::enumerateProcessorsFromMADT(void) {
 	if (!fUACPIStarted) return 0;
@@ -1001,6 +1103,7 @@ void PDACPIPlatformExpert::registerProcessors(void) {
 	AppleI386CPU *cpus[kMaxCPUs];
 
 	// cpu_id is an IOCPU *, not an index: PE_cpu_machine_init() casts it back.
+	cloke_trace("REGISTER %u PROCESSORS (BOOT LAPIC %u)", fCPUCount, fLapicIds[0]);
 	cpus[0] = bootCPU;
 	for (unsigned i = 1; i < fCPUCount; i++) {
 		cpus[i] = new AppleI386CPU;
@@ -1014,9 +1117,11 @@ void PDACPIPlatformExpert::registerProcessors(void) {
 
 	for (unsigned i = 0; i < fCPUCount; i++) {
 		procs[i] = NULL;
+		cloke_trace("REG %u LAPIC %u ...", i, fLapicIds[i]);
 		kern_return_t kr = ml_processor_register((cpu_id_t)cpus[i],
 		                                         fLapicIds[i], &procs[i],
 		                                         i == 0, FALSE);
+		cloke_trace("REG %u LAPIC %u KR 0x%x", i, fLapicIds[i], kr);
 		if (kr != KERN_SUCCESS) {
 			kprintf("PDACPIPlatform: registering LAPIC %u failed (0x%x)\n",
 			        fLapicIds[i], kr);
@@ -1026,9 +1131,11 @@ void PDACPIPlatformExpert::registerProcessors(void) {
 	}
 
 	for (unsigned i = 0; i < fCPUCount; i++) {
+		cloke_trace("START %u LAPIC %u ...", i, fLapicIds[i]);
 		kern_return_t kr = ml_processor_register((cpu_id_t)cpus[i],
 		                                         fLapicIds[i], &procs[i],
 		                                         i == 0, TRUE);
+		cloke_trace("START %u LAPIC %u KR 0x%x", i, fLapicIds[i], kr);
 		if (kr != KERN_SUCCESS) {
 			kprintf("PDACPIPlatform: starting LAPIC %u failed (0x%x)\n",
 			        fLapicIds[i], kr);

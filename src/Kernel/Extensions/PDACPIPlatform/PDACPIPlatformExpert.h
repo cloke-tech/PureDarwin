@@ -56,6 +56,7 @@ private:
 
 	unsigned enumerateProcessorsFromMADT(void);
 	void     registerProcessors(void);
+	unsigned clokeFitTopology(unsigned count);
 
 	static int handlePEHaltRestart(unsigned int type);
 
